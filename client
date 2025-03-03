@@ -1,0 +1,205 @@
+#!/usr/bin/env python3
+import socket
+import ssl
+import json
+import sys
+
+# This function sends a JSON message over the socket
+def send_message(sock, message):
+    '''
+    A print statement to log and debug client-to-server messages
+    Remove the '#' in the statement to see the messages
+    '''
+    # print(f"C -> S: {message}\n")
+    sock.sendall((message + "\n").encode())
+
+# This is a function to receive a JSON message over the socket
+def receive_message(sock):
+    '''
+    Receive a JSON message from the socket, ensuring that the message ends with a newline
+    This function returns the decoded message as a string
+    '''
+    data = b""
+    while not data.endswith(b"\n"):
+        chunk = sock.recv(4096)
+        if not chunk:
+            # Handle connection loss
+            raise ConnectionError("Socket connection lost.")
+        data += chunk
+    response = data.decode().strip()
+    '''
+    This print statement is used to log messages received from the server for debug purposes. 
+    Remove the '#' to see the messages
+    '''
+    # print(f"S -> C: {response}\n")
+    return response
+
+# This is a function that filters the wordlist based on previous guesses and their feedback from the server
+def filter_wordlist(wordlist, guesses):
+    for guess in guesses:
+        guess_word = guess["word"] # The guessed word
+        marks = guess["marks"]     # Feedback marks from the server
+
+        # This is a helper function that checks if a word is valid based on the feedback marks from the server
+        def is_word_valid(word):
+            # Count occurrences of each letter in the word
+            word_letter_count = {letter: word.count(letter) for letter in set(word)}
+            guess_letter_count = {letter: guess_word.count(letter) for letter in set(guess_word)}
+            temp_letter_count = word_letter_count.copy()
+
+            # Iterate over feedback marks and see if word is valid
+            for i, mark in enumerate(marks):
+                '''
+                For the game, there are 3 feedback marks that a word can receive
+                2 - Letter appears in the word in this position
+                1 - Letter appears in the word but not in this position
+                0 - Letter does not appear in the word
+                '''
+                guess_letter = guess_word[i]
+
+                if mark == 2:
+                    # If the letter does not match in the position, invalidate word
+                    if word[i] != guess_letter:
+                        return False
+
+                    # Decrement the temporary count for the letter to ensure no overuse
+                    temp_letter_count[guess_letter] -= 1
+
+                elif mark == 1:
+                    # If letter matches the position, invalidate word
+                    if word[i] == guess_letter:
+                        return False
+                    
+                    # If there are no occurrences left in the temporary count, invalidate word
+                    if temp_letter_count.get(guess_letter, 0) <= 0:
+                        return False
+                    
+                    temp_letter_count[guess_letter] -= 1
+
+                elif mark == 0:
+                    ''' 
+                    If the letter exists in the word, invalidate word
+                    For this mark, since there were edge cases of double letters, 
+                    the number of times it has ben marked needs to be checked as well to invalidate the word
+                    '''
+                    if guess_letter in word and (
+                        word_letter_count[guess_letter] >
+                        sum(1 for j, m in enumerate(marks) if guess_word[j] == guess_letter and m > 0)
+                    ):
+                        return False
+
+            return True
+
+        # Update the new wordlist with only valid words
+        wordlist[:] = [word for word in wordlist if is_word_valid(word)]
+
+        # Print the current wordlist post-filter for debug purposes - Uncomment the next two lines to see the temporary wordlists
+        # print(f"Temporary wordlist after filtering with guess {guess_word}:")
+        # print(wordlist)
+
+    return wordlist
+
+# This is the main function to handle general argument processing and game initialization
+def main():
+    # Initialize default connection settings
+    use_tls = False
+    port = 27993
+    hostname = None
+    username = None
+
+    # Parse command line arguments
+    args = sys.argv[1:]
+    i = 0
+    while i < len(args):
+        arg = args[i]
+
+        if arg == "-s": # Use a TLS connection and change port
+            use_tls = True
+            port = 27994
+
+        elif arg == "-p": # Specify a custom port
+            i += 1
+            port = int(args[i])
+
+        elif hostname is None: # First non-flag argument is the hostname
+            hostname = arg
+
+        elif username is None: # Second non-flag argument is the username
+            username = arg
+
+        i += 1
+
+    # Check if the hostname and username are provided, if not - print an error and exit
+    if not hostname or not username:
+        print("Usage: ./client <-p port> <-s> <hostname> <Northeastern-username>")
+        sys.exit(1)
+
+    # Connect to the server
+    try:
+        if use_tls:
+            # Establish a TLS connection with the server and handle the game
+            context = ssl.create_default_context()
+            with socket.create_connection((hostname, port)) as raw_sock:
+                with context.wrap_socket(raw_sock, server_hostname=hostname) as sock:
+                    handle_game(sock, username)
+        else:
+            # Establish a TCP connection with the server and handle the game
+            with socket.create_connection((hostname, port)) as sock:
+                handle_game(sock, username)
+    except Exception as e:
+        # Handle connection errors and exit
+        print(f"Error: {e}")
+        sys.exit(1)
+
+# This function handles the game protocol
+def handle_game(sock, username):
+    # Send "hello" message to the server
+    hello_message = json.dumps({"type": "hello", "northeastern_username": username})
+    send_message(sock, hello_message)
+
+    # Receive "start" message with the game ID
+    response = receive_message(sock)
+    start_message = json.loads(response)
+    game_id = start_message["id"]
+
+    # Open and read the wordlist from a file
+    with open("wordlist.txt", "r") as file:
+        wordlist = [line.strip().lower() for line in file]
+
+    guesses = []  # Store guesses and feedback
+    used_words = set()  # Track used words to avoid duplicating guesses
+
+    while True:
+        # Filter wordlist based on feedback
+        filter_wordlist(wordlist, guesses)
+
+        # If no words are possible, terminate the loop and end the game
+        if not wordlist:
+            print("No valid guesses remaining. Exiting.")
+            send_message(sock, json.dumps({"type": "bye"}))
+            break
+
+        # Guess the first word from the filtered list
+        word = wordlist[0]
+        used_words.add(word)
+        guess_message = json.dumps({"type": "guess", "id": game_id, "word": word})
+        send_message(sock, guess_message)
+
+        # Receive server response
+        response = receive_message(sock)
+        server_response = json.loads(response)
+
+        # Handle server response types
+        if server_response["type"] == "bye": # Game finished, receive flag
+            print(server_response['flag'])
+            print(f"Flag length: {len(server_response['flag'])}")
+            break
+        elif server_response["type"] == "retry": # Word incorrect, update guesses with feedback from server
+            guesses = server_response["guesses"]  
+        elif server_response["type"] == "error": # Handle errors - <500 incorrect guesses
+            print(f"Error from server: {server_response['message']}")
+            break
+
+# Entry point for the script
+if __name__ == "__main__":
+    main()
